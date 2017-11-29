@@ -1,24 +1,36 @@
-//test song is  "song.vgm"
-
 #include <Arduino.h>
 #include "SdFat.h"
 #include "LTC6903.h"
 #include "AY38910.h"
-//#include "YM2413.h"
+#include "YM2413.h"
 
-LTC6903 clk_AY3810(10, 831, 19); //LTC 1.79042MHz, actual clock is 1.7897725MHz (NTSC colorburst / 2)
-AY38910 ay38910(&PORTF, &DDRF, 8, 9); //BDIR 8, BC1 9         @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@CHANGE FOR TEENSY 3.5 UPGRADE!
+int AY_Datapins[8] = {14, 39, 38, 37, 36, 35, 34, 33};
+int AY_BC1 = 15;
+int AY_BDIR = 16;
 
-SdFat SD;
+int YM_Datapins[8] = {25, 26, 27, 28, 29, 30, 31, 32};
+int YM_CS = 17;
+int YM_WE = 18;
+int YM_A0 = 19;
+int YM_IC = 20;
+
+LTC6903 clk_AY3810(10, 831, 24); //LTC 1.79042MHz, actual clock is 1.7897725MHz (NTSC colorburst / 2)
+AY38910 ay38910(AY_Datapins, AY_BDIR, AY_BC1); //BDIR 8, BC1 9 
+YM2413 ym2413(YM_Datapins, YM_CS, YM_A0, YM_WE, YM_IC);
+
+SdFatSdio SD;
 File vgm;
 
-//Buffer
-const unsigned int MAX_CMD_BUFFER = 32;
+//Buffer & file stream
+const unsigned int MAX_CMD_BUFFER = 1;
 unsigned char cmdBuffer[MAX_CMD_BUFFER];
 uint32_t bufferPos = 0;
 const unsigned int MAX_FILE_NAME_SIZE = 1024;
 char fileName[MAX_FILE_NAME_SIZE];
 unsigned char cmd = 0;
+uint16_t numberOfFiles = 0;
+int32_t currentFileNumber = 0;
+
 
 //Timing Variables
 float singleSampleWait = 0;
@@ -32,6 +44,19 @@ unsigned long lastWaitData61 = 0;
 unsigned long cachedWaitTime61 = 0;
 unsigned long pauseTime = 0;
 unsigned long startTime = 0;
+
+//Song Data Variables
+uint32_t loopOffset = 0;
+uint16_t loopCount = 0;
+uint16_t nextSongAfterXLoops = 3;
+enum PlayMode {LOOP, PAUSE, SHUFFLE, IN_ORDER};
+PlayMode playMode = SHUFFLE;
+
+//GD3 Data
+String trackTitle;
+String gameName;
+String systemName;
+String gameDate;
 
 
 void FillBuffer()
@@ -90,22 +115,243 @@ void RemoveSVI() //Sometimes, Windows likes to place invisible files in our SD c
   nextFile.close();
 }
 
-void setup()
+void ClearTrackData()
 {
-    clk_AY3810.Set();
-    if(!SD.begin())
-    {
-        Serial.println("Card Mount Failed");
-        return;
-    }
-    ClearBuffers();
-    vgm.open("song.vgm", FILE_READ);
-    if(!vgm)
-      Serial.println("File open failed!");
+  for(int i = 0; i < MAX_FILE_NAME_SIZE; i++)
+    fileName[i] = 0;
+  trackTitle = "";
+  gameName = "";
+  systemName = "";
+  gameDate = "";
+}
+
+uint32_t EoFOffset = 0;
+uint32_t VGMVersion = 0;
+uint32_t GD3Offset = 0;
+void GetHeaderData() //Scrape off the important VGM data from the header, then drop down to the GD3 area for song info data
+{
+  ReadBuffer32(); //V - G - M 0x00->0x03
+  EoFOffset = ReadBuffer32(); //End of File offset 0x04->0x07
+  VGMVersion = ReadBuffer32(); //VGM Version 0x08->0x0B
+  for(int i = 0x0C; i<0x14; i++)GetByte(); //Skip 0x0C->0x14
+  GD3Offset = ReadBuffer32(); //GD3 (song info) data offset 0x14->0x17
+
+  uint32_t bufferReturnPosition = vgm.position();
+  vgm.seek(0);
+  vgm.seekCur(GD3Offset+0x14);
+  uint32_t GD3Position = 0x00;
+  ReadSD32(); GD3Position+=4;  //G - D - 3
+  ReadSD32(); GD3Position+=4;  //Version data
+  uint32_t dataLength = ReadSD32(); //Get size of data payload
+  GD3Position+=4;
+
+  String rawGD3String;
+  // Serial.print("DATA LENGTH: ");
+  // Serial.println(dataLength);
+
+  for(int i = 0; i<dataLength; i++) //Convert 16-bit characters to 8 bit chars. This may cause issues with non ASCII characters. (IE Japanese chars.)
+  {
+    char c1 = vgm.read();
+    char c2 = vgm.read();
+    if(c1 == 0 && c2 == 0)
+      rawGD3String += '\n';
     else
-      Serial.println("Opened successfully...");
-    FillBuffer();
-    singleSampleWait = ((1000.0 / (sampleRate/(float)1))*1000);
+      rawGD3String += char(c1);
+  }
+  GD3Position = 0;
+
+  while(rawGD3String[GD3Position] != '\n') //Parse out the track title.
+  {
+    trackTitle += rawGD3String[GD3Position];
+    GD3Position++;
+  }
+  GD3Position++;
+
+  while(rawGD3String[GD3Position] != '\n') GD3Position++; //Skip Japanese track title.
+  GD3Position++;
+  while(rawGD3String[GD3Position] != '\n') //Parse out the game name.
+  {
+    gameName += rawGD3String[GD3Position];
+    GD3Position++;
+  }
+  GD3Position++;
+  while(rawGD3String[GD3Position] != '\n') GD3Position++;//Skip Japanese game name.
+  GD3Position++;
+  while(rawGD3String[GD3Position] != '\n') //Parse out the system name.
+  {
+    systemName += rawGD3String[GD3Position];
+    GD3Position++;
+  }
+  GD3Position++;
+  while(rawGD3String[GD3Position] != '\n') GD3Position++;//Skip Japanese system name.
+  GD3Position++;
+  while(rawGD3String[GD3Position] != '\n') GD3Position++;//Skip English authors
+  GD3Position++;
+  // while(rawGD3String[GD3Position] != 0) //Parse out the music authors (I skipped this since it sometimes produces a ton of data! Uncomment this, comment skip, add vars if you want this.)
+  // {
+  //   musicAuthors += rawGD3String[GD3Position];
+  //   GD3Position++;
+  // }
+  while(rawGD3String[GD3Position] != '\n') GD3Position++;//Skip Japanese authors.
+  GD3Position++;
+  while(rawGD3String[GD3Position] != '\n') //Parse out the game date
+  {
+    gameDate += rawGD3String[GD3Position];
+    GD3Position++;
+  }
+  GD3Position++;
+  Serial.println(trackTitle);
+  Serial.println(gameName);
+  Serial.println(systemName);
+  Serial.println(gameDate);
+  Serial.println("");
+  vgm.seek(bufferReturnPosition); //Send the file seek back to the original buffer position so we don't confuse our program.
+  waitSamples = ReadBuffer32(); //0x18->0x1B : Get wait Samples count
+  loopOffset = ReadBuffer32();  //0x1C->0x1F : Get loop offset Postition
+  for(int i = 0; i<5; i++) ReadBuffer32(); //Skip right to the VGM data offset position;
+  uint32_t vgmDataOffset = ReadBuffer32();
+  if(vgmDataOffset == 0 || vgmDataOffset == 12) //VGM starts at standard 0x40
+  {
+    ReadBuffer32(); ReadBuffer32();
+  }
+  else
+  {
+    for(int i = 0; i < vgmDataOffset; i++) GetByte();  //VGM starts at different data position (Probably VGM spec 1.7+)
+  }
+}
+
+enum StartUpProfile {FIRST_START, NEXT, PREVIOUS, RNG, REQUEST};
+void StartupSequence(StartUpProfile sup, String request = "")
+{
+  File nextFile;
+  ClearTrackData();
+  switch(sup)
+  {
+    case FIRST_START:
+    {
+      nextFile.openNext(SD.vwd(), O_READ);
+      nextFile.getName(fileName, MAX_FILE_NAME_SIZE);
+      nextFile.close();
+      currentFileNumber = 0;
+    }
+    break;
+    case NEXT:
+    {
+      if(currentFileNumber+1 >= numberOfFiles)
+      {
+          SD.vwd()->rewind();
+          currentFileNumber = 0;
+      }
+      else
+          currentFileNumber++;
+      nextFile.openNext(SD.vwd(), O_READ);
+      nextFile.getName(fileName, MAX_FILE_NAME_SIZE);
+      nextFile.close();
+    }
+    break;
+    case PREVIOUS:
+    {
+      if(currentFileNumber != 0)
+      {
+        currentFileNumber--;
+        SD.vwd()->rewind();
+        for(int i = 0; i<=currentFileNumber; i++)
+        {
+          nextFile.close();
+          nextFile.openNext(SD.vwd(), O_READ);
+        }
+        nextFile.getName(fileName, MAX_FILE_NAME_SIZE);
+        nextFile.close();
+      }
+      else
+      {
+        currentFileNumber = numberOfFiles-1;
+        SD.vwd()->rewind();
+        for(int i = 0; i<=currentFileNumber; i++)
+        {
+          nextFile.close();
+          nextFile.openNext(SD.vwd(), O_READ);
+        }
+        nextFile.getName(fileName, MAX_FILE_NAME_SIZE);
+        nextFile.close();
+      }
+    }
+    break;
+    case RNG:
+    {
+      randomSeed(micros());
+      uint16_t randomFile = currentFileNumber;
+      while(randomFile == currentFileNumber)
+        randomFile = random(numberOfFiles-1);
+      currentFileNumber = randomFile;
+      SD.vwd()->rewind();
+      nextFile.openNext(SD.vwd(), O_READ);
+      {
+        for(int i = 0; i<randomFile; i++)
+        {
+          nextFile.close();
+          nextFile.openNext(SD.vwd(), O_READ);
+        }
+      }
+      nextFile.getName(fileName, MAX_FILE_NAME_SIZE);
+      nextFile.close();
+    }
+    break;
+    case REQUEST:
+    {
+      SD.vwd()->rewind();
+      bool fileFound = false;
+      Serial.print("REQUEST: ");Serial.println(request);
+      for(int i = 0; i<numberOfFiles; i++)
+      {
+        nextFile.close();
+        nextFile.openNext(SD.vwd(), O_READ);
+        nextFile.getName(fileName, MAX_FILE_NAME_SIZE);
+        String tmpFN = String(fileName);
+        tmpFN.trim();
+        if(tmpFN == request.trim())
+        {
+          currentFileNumber = i;
+          fileFound = true;
+          break;
+        }
+      }
+      nextFile.close();
+      if(fileFound)
+      {
+        Serial.println("File found!");
+      }
+      else
+      {
+        Serial.println("ERROR: File not found! Continuing with current song.");
+        return;
+      }
+    }
+    break;
+  }
+  ym2413.Reset();
+  ay38910.Reset();
+  waitSamples = 0;
+  loopOffset = 0;
+  lastWaitData61 = 0;
+  cachedWaitTime61 = 0;
+  pauseTime = 0;
+  startTime = 0;
+  loopCount = 0;
+  cmd = 0;
+  ClearBuffers();
+  Serial.print("Current file number: "); Serial.print(currentFileNumber+1); Serial.print("/"); Serial.println(numberOfFiles);
+  if(vgm.isOpen())
+    vgm.close();
+  vgm = SD.open(fileName, FILE_READ);
+  if(!vgm)
+    Serial.println("File open failed!");
+  else
+    Serial.println("Opened successfully...");
+  FillBuffer();
+  GetHeaderData();
+  singleSampleWait = ((1000.0 / (sampleRate/(float)1))*1000);
+
     for(int i = 0; i<16; i++)
     {
       if(i == 0)
@@ -119,62 +365,117 @@ void setup()
         preCalced7nDelays[i] = ((1000.0 / (sampleRate/(float)i+1))*1000);
       }
     }
-    Serial.begin(115200);
+
+    delay(500);
+}
+
+void setup()
+{
+    clk_AY3810.Set();
+    ym2413.Reset();
+    ay38910.Reset();
+    if(!SD.begin())
+    {
+        Serial.println("Card Mount Failed");
+        return;
+    }
+    RemoveSVI();
+    File countFile;
+    while ( countFile.openNext( SD.vwd(), O_READ ))
+    {
+      countFile.close();
+      numberOfFiles++;
+    }
+    countFile.close();
+    SD.vwd()->rewind();
+    StartupSequence(FIRST_START);
 }
 
 void loop()
 {
+  while(Serial.available() || Serial2.available())
+  {
+    bool USBorBluetooh = Serial.available();
+    char serialCmd = USBorBluetooh ? Serial.read() : Serial2.read();
+    switch(serialCmd)
+    {
+      case '+': //Next song
+        StartupSequence(NEXT);
+      break;
+      case '-': //Previous Song
+        StartupSequence(PREVIOUS);
+      break;
+      case '*': //Pick random song
+        StartupSequence(RNG);
+      break;
+      case '/': //Toggle shuffle mode
+        playMode == SHUFFLE ? playMode = IN_ORDER : playMode = SHUFFLE;
+        playMode == SHUFFLE ? Serial.println("SHUFFLE ON") : Serial.println("SHUFFLE OFF");
+        //DrawOledPage();
+      break;
+      case '.': //Toggle loop mode
+        playMode == LOOP ? playMode = IN_ORDER : playMode = LOOP;
+        playMode == LOOP ? Serial.println("LOOP ON") : Serial.println("LOOP OFF");
+        //DrawOledPage();
+      break;
+      case 'r': //Song Request, format:  r:mySongFileName.vgm - An attempt will be made to find and open that file.
+        String req = USBorBluetooh ? Serial.readString(1024) : Serial2.readString(1024);
+        req.remove(0, 1); //Remove colon character
+        StartupSequence(REQUEST, req);
+      break;
+    }
+  }
+
+
   unsigned long timeInMicros = micros();
   if( timeInMicros - startTime <= pauseTime)
   {
-    Serial.print("Wait time: ");
-    Serial.println(pauseTime);
+    // Serial.print("timeInMicros"); Serial.print("\t"); Serial.println(timeInMicros);
+    // Serial.print("DELTA"); Serial.print("\t"); Serial.println(timeInMicros - startTime);
+    // Serial.print("startTime"); Serial.print("\t"); Serial.println(startTime);
+    //Serial.print("pauseTime"); Serial.print("\t"); Serial.println(pauseTime);
+    //delay(150);
     return;
   }
   cmd = GetByte();
-  Serial.println(cmd, HEX);
   switch(cmd)
   {
     case 0xA0:
     {
-      unsigned char d = GetByte();
       unsigned char a = GetByte();
+      unsigned char d = GetByte();
       ay38910.Send(a, d);
     }
+    break;
     case 0x61:
     {
       //Serial.print("0x61 WAIT: at location: ");
       //Serial.print(parseLocation);
       //Serial.print("  -- WAIT TIME: ");
-    uint32_t wait = 0;
-    for ( int i = 0; i < 2; i++ )
-    {
-      wait += ( uint32_t( GetByte() ) << ( 8 * i ));
-    }
+      uint32_t wait = 0;
+      for ( int i = 0; i < 2; i++ )
+      {
+        wait += ( uint32_t( GetByte() ) << ( 8 * i ));
+      }
 
-    if(floor(lastWaitData61) != wait) //Avoid doing lots of unnecessary division.
-    {
-      lastWaitData61 = wait;
-      if(wait == 0)
-        break;
-      cachedWaitTime61 = ((1000.0 / (sampleRate/(float)wait))*1000);
-    }
-    //Serial.println(cachedWaitTime61);
 
     startTime = timeInMicros;
-    pauseTime = cachedWaitTime61;
+    pauseTime = ((1000.0 / (sampleRate/(float)wait))*1000);
+    //delayMicroseconds(cachedWaitTime61);
     //delay(cachedWaitTime61);
     break;
     }
     case 0x62:
     startTime = timeInMicros;
     pauseTime = WAIT60TH;
-    //delay(WAIT60TH); //Actual time is 16.67ms (1/60 of a second)
+    //delay(16.67);
+    //delayMicroseconds(WAIT60TH); //Actual time is 16.67ms (1/60 of a second)
     break;
     case 0x63:
     startTime = timeInMicros;
     pauseTime = WAIT50TH;
-    //delay(WAIT50TH); //Actual time is 20ms (1/50 of a second)
+    //delay(20);
+    //delayMicroseconds(WAIT50TH); //Actual time is 20ms (1/50 of a second)
     break;
     case 0x70:
     case 0x71:
@@ -203,18 +504,24 @@ void loop()
     break;
     }
     case 0x66:
-      ClearBuffers();
+      if(loopOffset == 0)
+        loopOffset = 64;
+      loopCount++;
+      vgm.seek(loopOffset);
       FillBuffer();
       bufferPos = 0;
-      // if(loopOffset == 0)
-      //   loopOffset = 64;
-      // loopCount++;
-      // vgm.seek(loopOffset);
-      // FillBuffer();
-      // bufferPos = 0;
+      break;
+      case 0x51:
+      {
+        unsigned char a = GetByte();
+        unsigned char d = GetByte();
+        ym2413.Send(a, d);
+      }
       break;
       default:
+      Serial.print("Defauled command: "); Serial.println(cmd, HEX);
       break;
+
   }
 
 }
